@@ -1,7 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use reqwest::Client;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -13,6 +13,9 @@ use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
 struct Args {
+    #[clap(subcommand)]
+    command: Command,
+
     #[clap(env)]
     square_location_id: String,
 
@@ -23,111 +26,146 @@ struct Args {
     square_access_token: String,
 }
 
+#[derive(Debug, Clone, Subcommand)]
+enum Command {
+    ListZeroMargin,
+    ApplyPriceTargets,
+}
+
 #[tokio::main]
 pub async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = Args::parse();
     let client = square_client(&args);
 
-    println!("Fetching catalog...");
-    let variations = get_item_variations(&client)
-        .await?
-        .into_iter()
-        .filter(|v| !v.is_deleted)
-        .filter(|v| {
-            v.data
-                .default_unit_cost
-                .as_ref()
-                .is_some_and(|n| n.amount > 0)
-        })
-        .filter(|v| {
-            v.data.price_money.as_ref().is_some_and(|n| {
-                n.amount > 0 && n.amount != v.data.default_unit_cost.as_ref().unwrap().amount
-            })
-        })
-        .collect::<Vec<_>>();
-    println!("Processing {} variations", variations.len());
+    match args.command {
+        Command::ListZeroMargin => {
+            let rows = get_item_variations(&client)
+                .await?
+                .into_iter()
+                .filter(|v| !v.is_deleted)
+                .filter_map(|v| {
+                    let unit = v.data.default_unit_cost.as_ref()?.amount;
+                    let price = v.data.price_money.as_ref()?.amount;
 
-    let item_tax_map = variations
-        .chunks(1000)
-        .map(|chunk| get_item_taxes(client.clone(), chunk.to_vec()))
-        .collect::<JoinSet<_>>()
-        .join_all()
-        .await
-        .into_iter()
-        .flatten()
-        .reduce(|mut acc, val| {
-            acc.extend(val);
-            acc
-        })
-        .unwrap();
+                    if price > unit {
+                        return None;
+                    }
 
-    let updates = variations
-        .iter()
-        .filter_map(|v| {
-            let mut price = v.price_data(match item_tax_map.get(&v.data.item_id)?.as_str() {
-                "2CJE55HCPJY5LHB4ZUEDCRJF" => dec!(0.0),
-                "3TXZ4AJ4DUCSI6YDBKXHBLRQ" => dec!(0.05),
-                "QDKOK36EMFC7772L2V64U6YD" => dec!(0.20),
-                _ => unreachable!(),
-            })?;
+                    Some(format!(
+                        "{},{},{},{},{}",
+                        v.data.item_id, v.id, v.data.name, unit, price
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            println!("ItemId,VariationId,Name,UnitPrice,RetailPrice");
+            println!("{}", rows);
+        }
+        Command::ApplyPriceTargets => {
+            println!("Fetching catalog...");
+            let variations = get_item_variations(&client)
+                .await?
+                .into_iter()
+                .filter(|v| !v.is_deleted)
+                .filter(|v| {
+                    v.data
+                        .default_unit_cost
+                        .as_ref()
+                        .is_some_and(|n| n.amount > 0)
+                })
+                .filter(|v| {
+                    v.data.price_money.as_ref().is_some_and(|n| {
+                        n.amount > 0
+                            && n.amount != v.data.default_unit_cost.as_ref().unwrap().amount
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("Processing {} variations", variations.len());
 
-            if price.por() >= dec!(0.4) {
-                return None;
-            }
+            let item_tax_map = variations
+                .chunks(1000)
+                .map(|chunk| get_item_taxes(client.clone(), chunk.to_vec()))
+                .collect::<JoinSet<_>>()
+                .join_all()
+                .await
+                .into_iter()
+                .flatten()
+                .reduce(|mut acc, val| {
+                    acc.extend(val);
+                    acc
+                })
+                .unwrap();
 
-            let original = price.clone();
-            price.set_por(dec!(0.4));
-            price.round_to_retail();
+            let updates = variations
+                .iter()
+                .filter_map(|v| {
+                    let mut price =
+                        v.price_data(match item_tax_map.get(&v.data.item_id)?.as_str() {
+                            "2CJE55HCPJY5LHB4ZUEDCRJF" => dec!(0.0),
+                            "3TXZ4AJ4DUCSI6YDBKXHBLRQ" => dec!(0.05),
+                            "QDKOK36EMFC7772L2V64U6YD" => dec!(0.20),
+                            _ => unreachable!(),
+                        })?;
 
-            Some((
-                original.por(),
-                price.clone().por(),
-                UpdateItemVariation {
-                    kind: "ITEM_VARIATION".to_string(),
-                    id: v.id.clone(),
-                    data: UpdateItemVariationData {
-                        price_money: Money {
-                            amount: (price.rrp * dec!(100)).round_dp(2).to_i64()?,
-                            currency: "GBP".to_string(),
+                    if price.por() >= dec!(0.4) {
+                        return None;
+                    }
+
+                    let original = price.clone();
+                    price.set_por(dec!(0.4));
+                    price.round_to_retail();
+
+                    Some((
+                        original.por(),
+                        price.clone().por(),
+                        UpdateItemVariation {
+                            kind: "ITEM_VARIATION".to_string(),
+                            id: v.id.clone(),
+                            data: UpdateItemVariationData {
+                                price_money: Money {
+                                    amount: (price.rrp * dec!(100)).round_dp(2).to_i64()?,
+                                    currency: "GBP".to_string(),
+                                },
+                            },
                         },
-                    },
-                },
-            ))
-        })
-        .collect::<Vec<_>>();
+                    ))
+                })
+                .collect::<Vec<_>>();
 
-    dbg!(&updates);
-    println!("Updating {} prices", updates.len());
-    // curl https://connect.squareup.com/v2/catalog/list?types=ITEM_VARIATION \
-    //   -H 'Square-Version: 2025-10-16' \
-    //   -H 'Authorization: Bearer' \
-    //   -H 'Content-Type: application/json'
-    // -----------------------------------------------------------------------------------------------
-    // curl https://connect.squareup.com/v2/catalog/batch-upsert \
-    //   -X POST \
-    //   -H 'Square-Version: 2025-10-16' \
-    //   -H 'Authorization: Bearer' \
-    //   -H 'Content-Type: application/json' \
-    //   -d '{
-    //     "batches": [
-    //       {
-    //         "objects": [
-    //           {
-    //             "type": "ITEM_VARIATION",
-    //             "item_variation_data": {
-    //               "price_money": {
-    //                 "amount": 123,
-    //                 "currency": "GBP"
-    //               }
-    //             },
-    //             "id": ""
-    //           }
-    //         ]
-    //       }
-    //     ],
-    //     "idempotency_key": "bdf1cfff-aaf7-4b73-82d3-39068a71fcb9"
-    //   }'
+            dbg!(&updates);
+            println!("Updating {} prices", updates.len());
+            // curl https://connect.squareup.com/v2/catalog/list?types=ITEM_VARIATION \
+            //   -H 'Square-Version: 2025-10-16' \
+            //   -H 'Authorization: Bearer' \
+            //   -H 'Content-Type: application/json'
+            // -----------------------------------------------------------------------------------------------
+            // curl https://connect.squareup.com/v2/catalog/batch-upsert \
+            //   -X POST \
+            //   -H 'Square-Version: 2025-10-16' \
+            //   -H 'Authorization: Bearer' \
+            //   -H 'Content-Type: application/json' \
+            //   -d '{
+            //     "batches": [
+            //       {
+            //         "objects": [
+            //           {
+            //             "type": "ITEM_VARIATION",
+            //             "item_variation_data": {
+            //               "price_money": {
+            //                 "amount": 123,
+            //                 "currency": "GBP"
+            //               }
+            //             },
+            //             "id": ""
+            //           }
+            //         ]
+            //       }
+            //     ],
+            //     "idempotency_key": "bdf1cfff-aaf7-4b73-82d3-39068a71fcb9"
+            //   }'
+        }
+    }
 
     Ok(())
 }
@@ -157,6 +195,7 @@ struct ItemVariation {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ItemVariationData {
+    name: String,
     item_id: String,
     pricing_type: String,
     price_money: Option<Money>,
