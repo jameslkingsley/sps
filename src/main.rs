@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -6,8 +6,10 @@ use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use reqwest::Client;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use rust_decimal::{Decimal, RoundingStrategy, dec, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -27,10 +29,76 @@ pub async fn main() -> Result<()> {
     let args = Args::parse();
     let client = square_client(&args);
 
-    let variations = get_item_variations(&client).await?;
+    println!("Fetching catalog...");
+    let variations = get_item_variations(&client)
+        .await?
+        .into_iter()
+        .filter(|v| !v.is_deleted)
+        .filter(|v| {
+            v.data
+                .default_unit_cost
+                .as_ref()
+                .is_some_and(|n| n.amount > 0)
+        })
+        .filter(|v| {
+            v.data.price_money.as_ref().is_some_and(|n| {
+                n.amount > 0 && n.amount != v.data.default_unit_cost.as_ref().unwrap().amount
+            })
+        })
+        .collect::<Vec<_>>();
+    println!("Processing {} variations", variations.len());
 
-    dbg!(variations);
+    let item_tax_map = variations
+        .chunks(1000)
+        .map(|chunk| get_item_taxes(client.clone(), chunk.to_vec()))
+        .collect::<JoinSet<_>>()
+        .join_all()
+        .await
+        .into_iter()
+        .flatten()
+        .reduce(|mut acc, val| {
+            acc.extend(val);
+            acc
+        })
+        .unwrap();
 
+    let updates = variations
+        .iter()
+        .filter_map(|v| {
+            let mut price = v.price_data(match item_tax_map.get(&v.data.item_id)?.as_str() {
+                "2CJE55HCPJY5LHB4ZUEDCRJF" => dec!(0.0),
+                "3TXZ4AJ4DUCSI6YDBKXHBLRQ" => dec!(0.05),
+                "QDKOK36EMFC7772L2V64U6YD" => dec!(0.20),
+                _ => unreachable!(),
+            })?;
+
+            if price.por() >= dec!(0.4) {
+                return None;
+            }
+
+            let original = price.clone();
+            price.set_por(dec!(0.4));
+            price.round_to_retail();
+
+            Some((
+                original.por(),
+                price.clone().por(),
+                UpdateItemVariation {
+                    kind: "ITEM_VARIATION".to_string(),
+                    id: v.id.clone(),
+                    data: UpdateItemVariationData {
+                        price_money: Money {
+                            amount: (price.rrp * dec!(100)).round_dp(2).to_i64()?,
+                            currency: "GBP".to_string(),
+                        },
+                    },
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    dbg!(&updates);
+    println!("Updating {} prices", updates.len());
     // curl https://connect.squareup.com/v2/catalog/list?types=ITEM_VARIATION \
     //   -H 'Square-Version: 2025-10-16' \
     //   -H 'Authorization: Bearer' \
@@ -65,10 +133,153 @@ pub async fn main() -> Result<()> {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct UpdateItemVariation {
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    #[serde(rename = "item_variation_data")]
+    data: UpdateItemVariationData,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct UpdateItemVariationData {
+    price_money: Money,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ItemVariation {
     id: String,
     version: i64,
     is_deleted: bool,
+    #[serde(rename = "item_variation_data")]
+    data: ItemVariationData,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ItemVariationData {
+    item_id: String,
+    pricing_type: String,
+    price_money: Option<Money>,
+    default_unit_cost: Option<Money>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Money {
+    amount: i64,
+    currency: String,
+}
+
+#[derive(Debug, Clone)]
+struct PriceData {
+    rrp: Decimal,
+    unit: Decimal,
+    tax_rate: Decimal,
+}
+
+impl ItemVariation {
+    pub fn price_data(&self, tax_rate: Decimal) -> Option<PriceData> {
+        let rrp =
+            (Decimal::from(self.data.price_money.as_ref()?.amount) / dec!(100)).trunc_with_scale(2);
+
+        let unit = (Decimal::from(self.data.default_unit_cost.as_ref()?.amount) / dec!(100))
+            .trunc_with_scale(2);
+
+        Some(PriceData {
+            rrp,
+            unit,
+            tax_rate,
+        })
+    }
+}
+
+impl PriceData {
+    pub fn vat(&self) -> Decimal {
+        (self.rrp - (self.rrp / (self.tax_rate + dec!(1)))).round_dp(2)
+    }
+
+    pub fn net(&self) -> Decimal {
+        (self.rrp - self.vat()).round_dp(2)
+    }
+
+    pub fn profit(&self) -> Decimal {
+        self.net() - self.unit
+    }
+
+    pub fn por(&self) -> Decimal {
+        let net = self.net();
+        let profit = self.profit();
+        (profit / net).round_dp(2)
+    }
+
+    pub fn set_por(&mut self, por: Decimal) {
+        let net = self.unit / (dec!(1) - por);
+        let gross =
+            net.round_dp_with_strategy(2, RoundingStrategy::ToZero) * (self.tax_rate + dec!(1));
+        self.rrp = gross.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    }
+
+    pub fn round_to_retail(&mut self) {
+        let pennies = (self.rrp * dec!(100)).round_dp(0);
+        let Some(mut pennies) = pennies.to_i64() else {
+            return;
+        };
+
+        let sign = if pennies < 0 { -1 } else { 1 };
+        let last_digit = (pennies.abs() % 10) as i64;
+        let target = if last_digit <= 2 {
+            0
+        } else if last_digit <= 5 {
+            5
+        } else {
+            9
+        };
+        pennies += sign * (target - last_digit);
+
+        self.rrp = Decimal::new(pennies, 2);
+    }
+}
+
+async fn get_item_taxes(
+    client: ClientWithMiddleware,
+    variations: Vec<ItemVariation>,
+) -> Result<HashMap<String, String>> {
+    Ok(client
+        .post("https://connect.squareup.com/v2/catalog/batch-retrieve")
+        .json(&json!({
+            "object_ids": variations.iter().map(|v| v.data.item_id.clone()).collect::<Vec<_>>(),
+            "include_category_path_to_root": false,
+            "include_related_objects": false
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?
+        .get("objects")
+        .and_then(|objects| {
+            Some(
+                objects
+                    .as_array()
+                    .expect("as_array")
+                    .into_iter()
+                    .filter_map(|obj| {
+                        Some((
+                            obj.get("id").expect("id").as_str()?.to_string(),
+                            obj.get("item_data")
+                                .expect("item_data")
+                                .get("tax_ids")?
+                                .as_array()
+                                .expect("as_array")
+                                .get(0)
+                                .expect("get(0)")
+                                .as_str()?
+                                .to_string(),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+        .unwrap_or_default())
 }
 
 async fn get_item_variations(client: &ClientWithMiddleware) -> Result<Vec<ItemVariation>> {
